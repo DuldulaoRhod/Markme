@@ -29,11 +29,12 @@ if ($fullName === '' || $contactNumber === '' || $deliveryAddress === '') {
 $cartId = get_or_create_cart_id($user['user_id']);
 $pdo = db();
 
+$orderId = 0;
+$total = 0;
+
 try {
     $pdo->beginTransaction();
 
-    // Lock the product rows for the items in this cart so stock can be
-    // re-validated safely against concurrent orders before committing.
     $stmt = $pdo->prepare(
         'SELECT ci.cart_item_id, ci.product_id, ci.quantity, ci.shape_id, ci.design_id,
                 ci.custom_text, ci.custom_image_path,
@@ -61,7 +62,6 @@ try {
         }
     }
 
-    $total = 0;
     foreach ($items as $item) {
         $total += $item['price'] * $item['quantity'];
     }
@@ -114,21 +114,36 @@ try {
     $pdo->prepare('DELETE FROM cart_items WHERE cart_id = :cart_id')->execute(['cart_id' => $cartId]);
 
     $pdo->commit();
+} catch (RuntimeException $e) {
+    if ($pdo->inTransaction()) {
+        $pdo->rollBack();
+    }
+    flash_set('error', $e->getMessage());
+    redirect('/customer/cart.php');
+} catch (Throwable $e) {
+    if ($pdo->inTransaction()) {
+        $pdo->rollBack();
+    }
+    error_log('place_order failed: ' . $e->getMessage());
+    flash_set('error', 'An unexpected error occurred while placing your order. Please try again.');
+    redirect('/customer/checkout.php');
+}
 
-    // After the commit on purpose: the audit trail records what happened, so
-    // it must never be able to roll an order back.
+/* ---- The order is committed from here on. Nothing below may roll it back. ---- */
+
+try {
     log_activity(
         'order.placed',
         'Placed order #' . $orderId . ' for ' . format_price($total),
         'order',
         $orderId
     );
+} catch (Throwable $e) {
+    error_log('log_activity failed: ' . $e->getMessage());
+}
 
-    /* A card order is not finished yet: it has been recorded as Pending and
-       now needs paying. The amount sent to PayMongo is $total, computed above
-       from the products table - the browser never supplied a figure, and this
-       is the same number the provider's answer is checked against later. */
-    if ($paymentMethod === 'PayMongo') {
+if ($paymentMethod === 'PayMongo') {
+    try {
         $session = payment_start_checkout(
             ['order_id' => $orderId, 'total_amount' => $total],
             array_filter([
@@ -137,35 +152,29 @@ try {
                 'email' => $user['email'] ?? null,
             ])
         );
+    } catch (Throwable $e) {
+        error_log('PayMongo checkout failed: ' . $e->getMessage());
+        $session = ['ok' => false, 'error' => 'We could not reach the payment provider.'];
+    }
 
-        if (!$session['ok']) {
-            /* The order exists and is unpaid. Saying so is better than hiding
-               it: the basket has already been emptied and the stock reserved,
-               so pretending nothing happened would lose the order. */
-            flash_set('error', $session['error'] . ' Your order was saved and is waiting for payment.');
-            redirect('/customer/order_confirmation.php?order_id=' . $orderId);
-        }
+    if (!$session['ok']) {
+        flash_set('error', $session['error'] . ' Your order was saved and is waiting for payment.');
+        redirect('/customer/order_confirmation.php?order_id=' . $orderId);
+    }
 
+    try {
         log_activity(
             'payment.started',
             'Checkout session opened for order #' . $orderId,
             'order',
             $orderId
         );
-
-        // Off to PayMongo's hosted page. No card detail is collected here, or
-        // anywhere in MarkMe.
-        header('Location: ' . $session['url']);
-        exit;
+    } catch (Throwable $e) {
+        error_log('log_activity failed: ' . $e->getMessage());
     }
 
-    redirect('/customer/order_confirmation.php?order_id=' . $orderId);
-} catch (RuntimeException $e) {
-    $pdo->rollBack();
-    flash_set('error', $e->getMessage());
-    redirect('/customer/cart.php');
-} catch (Throwable $e) {
-    $pdo->rollBack();
-    flash_set('error', 'An unexpected error occurred while placing your order. Please try again.');
-    redirect('/customer/checkout.php');
+    header('Location: ' . $session['url']);
+    exit;
 }
+
+redirect('/customer/order_confirmation.php?order_id=' . $orderId);
